@@ -1,0 +1,226 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/nag/plan app/src/main/res/layout app/src/main/res/xml
+          cat > settings.gradle.kts <<'EOF_NAG'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NagPlan"
+          include(":app")
+          EOF_NAG
+          cat > build.gradle.kts <<'EOF_NAG'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF_NAG
+          echo "android.useAndroidX=true" > gradle.properties
+          cat > app/build.gradle.kts <<'EOF_NAG'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.nag.plan"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.nag.plan"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.appcompat:appcompat:1.6.1") }
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/java/com/nag/plan/Store.kt)
+          cat > app/src/main/java/com/nag/plan/Store.kt <<'EOF_NAG'
+          package com.nag.plan
+          import android.content.Context
+          object Store {
+              private fun p(c: Context) = c.getSharedPreferences("plan", 0)
+              fun tasks(c: Context): List<Pair<String, Boolean>> =
+                  (p(c).getString("t", "") ?: "").lines().filter { it.isNotBlank() }.map { it.drop(1) to (it[0] == '1') }
+              fun save(c: Context, l: List<Pair<String, Boolean>>) =
+                  p(c).edit().putString("t", l.joinToString("\n") { (if (it.second) "1" else "0") + it.first }).apply()
+              fun setDone(c: Context, i: Int) {
+                  val l = tasks(c).toMutableList()
+                  if (i in l.indices) { l[i] = l[i].first to true; save(c, l) }
+              }
+              fun pending(c: Context) = tasks(c).count { !it.second }
+          }
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/java/com/nag/plan/Nagger.kt)
+          cat > app/src/main/java/com/nag/plan/Nagger.kt <<'EOF_NAG'
+          package com.nag.plan
+          import android.app.*
+          import android.content.*
+          class Nagger : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  if (i.action == "DONE") Store.setDone(c, i.getIntExtra("i", -1))
+                  refresh(c)  // also runs on TICK and BOOT_COMPLETED
+              }
+              companion object {
+                  const val EVERY_MIN = 5L  // nag interval
+                  fun refresh(c: Context) {
+                      val nm = c.getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(NotificationChannel("nag", "Nag", NotificationManager.IMPORTANCE_HIGH))
+                      nm.cancelAll()  // re-posting makes it buzz again each cycle
+                      val fl = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      Store.tasks(c).forEachIndexed { idx, (name, done) ->
+                          if (!done) {
+                              val pi = PendingIntent.getBroadcast(c, idx,
+                                  Intent(c, Nagger::class.java).setAction("DONE").putExtra("i", idx), fl)
+                              nm.notify(idx, Notification.Builder(c, "nag")
+                                  .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                                  .setContentTitle("Do this now").setContentText(name)
+                                  .setOngoing(true)
+                                  .addAction(Notification.Action.Builder(0, "Done ✓", pi).build()).build())
+                          }
+                      }
+                      PlanWidget.update(c)
+                      val am = c.getSystemService(AlarmManager::class.java)
+                      val tick = PendingIntent.getBroadcast(c, 999, Intent(c, Nagger::class.java).setAction("TICK"), fl)
+                      if (Store.pending(c) > 0)
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + EVERY_MIN * 60000, tick)
+                      else am.cancel(tick)
+                  }
+              }
+          }
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/java/com/nag/plan/PlanWidget.kt)
+          cat > app/src/main/java/com/nag/plan/PlanWidget.kt <<'EOF_NAG'
+          package com.nag.plan
+          import android.app.PendingIntent
+          import android.appwidget.*
+          import android.content.*
+          import android.widget.*
+          class PlanWidget : AppWidgetProvider() {
+              override fun onUpdate(c: Context, m: AppWidgetManager, ids: IntArray) {
+                  ids.forEach { id ->
+                      val v = RemoteViews(c.packageName, R.layout.widget)
+                      v.setRemoteAdapter(R.id.list, Intent(c, WidgetService::class.java))
+                      v.setPendingIntentTemplate(R.id.list, PendingIntent.getBroadcast(c, 0,
+                          Intent(c, Nagger::class.java).setAction("DONE"),
+                          PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+                      m.updateAppWidget(id, v)
+                  }
+              }
+              companion object {
+                  fun update(c: Context) {
+                      val m = AppWidgetManager.getInstance(c)
+                      m.notifyAppWidgetViewDataChanged(m.getAppWidgetIds(ComponentName(c, PlanWidget::class.java)), R.id.list)
+                  }
+              }
+          }
+          class WidgetService : RemoteViewsService() {
+              override fun onGetViewFactory(i: Intent) = object : RemoteViewsFactory {
+                  var t = listOf<Pair<String, Boolean>>()
+                  override fun onCreate() {}
+                  override fun onDataSetChanged() { t = Store.tasks(applicationContext) }
+                  override fun onDestroy() {}
+                  override fun getCount() = t.size
+                  override fun getViewAt(p: Int): RemoteViews {
+                      val v = RemoteViews(packageName, R.layout.widget_item)
+                      v.setTextViewText(R.id.txt, (if (t[p].second) "☑ " else "☐ ") + t[p].first)
+                      v.setOnClickFillInIntent(R.id.txt, Intent().putExtra("i", p))
+                      return v
+                  }
+                  override fun getLoadingView(): RemoteViews? = null
+                  override fun getItemId(p: Int) = p.toLong()
+                  override fun getViewTypeCount() = 1
+                  override fun hasStableIds() = true
+              }
+          }
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/java/com/nag/plan/MainActivity.kt)
+          cat > app/src/main/java/com/nag/plan/MainActivity.kt <<'EOF_NAG'
+          package com.nag.plan
+          import android.Manifest
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Button
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          class MainActivity : AppCompatActivity() {
+              private val pick = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  uri ?: return@registerForActivityResult
+                  val lines = contentResolver.openInputStream(uri)!!.bufferedReader().readLines()
+                      .map { it.trim() }.filter { it.isNotEmpty() }
+                  Store.save(this, lines.map { it to false })
+                  Nagger.refresh(this)
+              }
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  setContentView(R.layout.activity_main)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  findViewById<Button>(R.id.upload).setOnClickListener { pick.launch("text/*") }
+              }
+          }
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_NAG'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <application android:label="NagPlan" android:theme="@style/Theme.AppCompat.DayNight">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".Nagger" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>
+                  </receiver>
+                  <receiver android:name=".PlanWidget" android:exported="true">
+                      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
+                  </receiver>
+                  <service android:name=".WidgetService" android:permission="android.permission.BIND_REMOTEVIEWS"/>
+              </application>
+          </manifest>
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/res/layout/activity_main.xml)
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF_NAG'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:gravity="center" android:orientation="vertical">
+              <Button android:id="@+id/upload" android:layout_width="wrap_content"
+                  android:layout_height="wrap_content" android:text="Upload plan (.txt, one task per line)"/>
+          </LinearLayout>
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/res/layout/widget.xml)
+          cat > app/src/main/res/layout/widget.xml <<'EOF_NAG'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:background="#CC202020" android:padding="8dp">
+              <ListView android:id="@+id/list" android:layout_width="match_parent" android:layout_height="match_parent"/>
+          </LinearLayout>
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/res/layout/widget_item.xml)
+          cat > app/src/main/res/layout/widget_item.xml <<'EOF_NAG'
+          <TextView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/txt" android:layout_width="match_parent" android:layout_height="wrap_content"
+              android:padding="8dp" android:textSize="16sp" android:textColor="#FFFFFF"/>
+          EOF_NAG
+          mkdir -p $(dirname app/src/main/res/xml/widget_info.xml)
+          cat > app/src/main/res/xml/widget_info.xml <<'EOF_NAG'
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp" android:minHeight="250dp"
+              android:initialLayout="@layout/widget" android:resizeMode="vertical|horizontal"
+              android:updatePeriodMillis="0" android:widgetCategory="home_screen"/>
+          EOF_NAG
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NagPlan-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
